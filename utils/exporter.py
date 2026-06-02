@@ -36,12 +36,13 @@ class PolicyExporter(nn.Module):
         self.input_dim = self.actor.input_dim
         state_dim = self.input_dim[0] if isinstance(self.input_dim, tuple) else self.input_dim
         perception_dim = self.input_dim[1] if isinstance(self.input_dim, tuple) else None
+        action_dim = actor_net.output_dim
         self.named_inputs = [
             ("state", torch.zeros(1, state_dim)),
             ("orientation", torch.zeros(1, 3)),
             ("Rz", torch.zeros(1, 3, 3)),
-            ("min_action", torch.zeros(1, 3)),
-            ("max_action", torch.zeros(1, 3)),
+            ("min_action", torch.zeros(1, action_dim)),
+            ("max_action", torch.zeros(1, action_dim)),
         ]
         if perception_dim is not None:
             if isinstance(self.actor, (MLP, RNN)):
@@ -77,12 +78,29 @@ class PolicyExporter(nn.Module):
         acc_norm = action.norm(p=2, dim=-1)
         return action, quat_xyzw, acc_norm
 
+    def post_process_body(self, raw_action, min_action, max_action, orientation, Rz, is_stochastic):
+        # type: (Tensor, Tensor, Tensor, Tensor, Tensor, bool) -> Tuple[Tensor, Tensor, Tensor]
+        # Quadrotor body-frame commands: rescale and pass through without rotation.
+        # quat_xyzw and acc_norm are not meaningful for body-frame motor commands;
+        # return identity quaternion and zero norm as placeholders.
+        raw_action = raw_action.tanh() if is_stochastic else raw_action
+        action = (raw_action * 0.5 + 0.5) * (max_action - min_action) + min_action
+        n = action.shape[0]
+        quat_xyzw = torch.cat([
+            torch.zeros(n, 3, dtype=action.dtype, device=action.device),
+            torch.ones(n, 1, dtype=action.dtype, device=action.device),
+        ], dim=-1)
+        acc_norm = torch.zeros(n, dtype=action.dtype, device=action.device)
+        return action, quat_xyzw, acc_norm
+
     def post_process(self, raw_action, min_action, max_action, orientation, Rz):
         # type: (Tensor, Tensor, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor]
         if self.action_frame == "local":
             return self.post_process_local(raw_action, min_action, max_action, orientation, Rz, self.is_stochastic)
         elif self.action_frame == "world":
             return self.post_process_world(raw_action, min_action, max_action, orientation, Rz, self.is_stochastic)
+        elif self.action_frame == "body":
+            return self.post_process_body(raw_action, min_action, max_action, orientation, Rz, self.is_stochastic)
         else:
             raise ValueError(f"Unknown action frame: {self.action_frame}")
     

@@ -1,0 +1,6 @@
+{
+  "pythonPath": "/home/dk77/miniconda3/envs/diffaero/bin/python",
+  "venvPath": "/home/dk77/miniconda3/envs",
+  "venv": "diffaero",
+  "extraPaths": ["/home/dk77/baselines/diffaero"]
+}

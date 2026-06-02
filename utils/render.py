@@ -639,8 +639,8 @@ class BaseRenderer:
 
 
 class PositionControlRenderer(BaseRenderer):
-    def __init__(self, cfg: DictConfig, device: torch.device):
-        super().__init__(cfg, device)
+    def __init__(self, cfg: DictConfig, device: torch.device, headless: bool = False):
+        super().__init__(cfg, device, headless=headless)
             
 
 class ObstacleAvoidanceRenderer(BaseRenderer):

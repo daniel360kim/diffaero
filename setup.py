@@ -3,8 +3,8 @@ from setuptools import setup, find_packages
 setup(
     name='diffaero',
     version='0.1',
-    # packages=find_packages(),
-    packages=[".", "env", "algo", "network", "utils", "script"],
+    packages=["diffaero", "diffaero.env", "diffaero.algo", "diffaero.network", "diffaero.utils", "diffaero.script"],
+    package_dir={"diffaero": "."},
     install_requires=[
         'torch>=2.0.0',
         'tensordict',
@@ -22,8 +22,7 @@ setup(
         'wandb',
         'gpustat',
         'opencv-python',
-        'pytorch3d@git+https://github.com/facebookresearch/pytorch3d.git@stable#egg=pytorch3d',
-        'open3d',
+'open3d',
         'numpy',
         'moviepy==1.0.3',
         'imageio',
