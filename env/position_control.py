@@ -27,7 +27,7 @@ class PositionControl(BaseEnv):
         if self.last_action_in_obs:
             self.obs_dim += self.action_dim
         self.state_dim = 13
-        self.renderer = None if cfg.render.headless else PositionControlRenderer(cfg.render, device)
+        self.renderer = PositionControlRenderer(cfg.render, device, headless=cfg.render.headless) if (not cfg.render.headless or cfg.render.record_video) else None
         self.check_dims()
     
     @timeit

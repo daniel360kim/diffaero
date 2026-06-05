@@ -48,8 +48,8 @@ ref_path:
 
 hydra:
   run:
-    dir: ./outputs/train/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: /rhf/dk77/diffaero/outputs/train/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
-    dir: ./outputs/train/${now:%Y-%m-%d}/multirun/${now:%H-%M-%S}
+    dir: /rhf/dk77/diffaero/outputs/train/${now:%Y-%m-%d}/multirun/${now:%H-%M-%S}
   launcher:
     n_jobs: ${n_jobs}

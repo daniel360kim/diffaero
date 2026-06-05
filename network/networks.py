@@ -43,6 +43,7 @@ class MLP(BaseNetwork):
         output_act: Optional[nn.Module] = None
     ):
         super().__init__(input_dim)
+        self.output_dim = output_dim
         if not isinstance(input_dim, int):
             D, (H, W) = input_dim
             input_dim = D + H * W
@@ -123,6 +124,7 @@ class CNN(BaseNetwork):
         output_act: Optional[nn.Module] = None
     ):
         super().__init__(input_dim)
+        self.output_dim = output_dim
         self.cnn = CNNBackbone(cfg.cnn_layers, input_dim)
         self.head = mlp(self.cnn.out_dim, cfg.hidden_dim, output_dim, output_act=output_act)
     
@@ -159,6 +161,7 @@ class RNN(BaseNetwork):
         output_act: Optional[nn.Module] = None
     ):
         super().__init__(input_dim, cfg.rnn_n_layers, cfg.rnn_hidden_dim)
+        self.output_dim = output_dim
         if not isinstance(input_dim, int):
             D, (H, W) = input_dim
             input_dim = D + H * W
@@ -223,6 +226,7 @@ class RCNN(BaseNetwork):
         output_act: Optional[nn.Module] = None
     ):
         super().__init__(input_dim, cfg.rnn_n_layers, cfg.rnn_hidden_dim)
+        self.output_dim = output_dim
         self.cnn = CNNBackbone(cfg.cnn_layers, input_dim)
         self.gru = torch.nn.GRU(
             input_size=self.cnn.out_dim,

@@ -211,12 +211,13 @@ class TestRunner:
     def run(self):
         if self.cfg.record_video:
             H_video, W_video = self.env.renderer.video_H, self.env.renderer.video_W
-            H_depth, W_depth = self.cfg.sensor.height, self.cfg.sensor.width
-            H_scale, W_scale = H_video / H_depth, W_video / W_depth
-            H_depth = H_video if H_scale >= W_scale else int(H_depth * W_scale)
-            W_depth = W_video if W_scale >= H_scale else int(W_depth * H_scale)
-            H, W = H_video, W_video + W_depth
-            video_array = np.empty((self.env.renderer.n_envs, self.env.max_steps, H, W, 3), dtype=np.uint8)
+            _has_sensor = hasattr(self.cfg, 'sensor')
+            if _has_sensor:
+                H_depth, W_depth = self.cfg.sensor.height, self.cfg.sensor.width
+                H_scale, W_scale = H_video / H_depth, W_video / W_depth
+                H_depth = H_video if H_scale >= W_scale else int(H_depth * W_scale)
+                W_depth = W_video if W_scale >= H_scale else int(W_depth * H_scale)
+            video_array = None  # allocated lazily on first frame once sensor presence is known
         
         obs = self.env.reset()
         n_resets = 1
@@ -249,10 +250,17 @@ class TestRunner:
                 n_envs = self.env.renderer.n_envs
                 rgb_image: np.ndarray = self.env.renderer.render_fpp(self.env.states_for_render())
                 index = (np.arange(n_envs), self.env.progress[:n_envs].cpu().numpy()-1)
-                depth_image = torchvision.transforms.Resize(
-                    (H_depth, W_depth), interpolation=torchvision.transforms.InterpolationMode.NEAREST)(env_info["sensor"][:n_envs])
-                depth_image = (depth_image * 255).to(torch.uint8).unsqueeze(-1).expand(-1, -1, -1, 3).cpu().numpy()
-                image = np.concatenate([rgb_image, depth_image], axis=-2)
+                _use_sensor = _has_sensor and "sensor" in env_info
+                if _use_sensor:
+                    depth_image = torchvision.transforms.Resize(
+                        (H_depth, W_depth), interpolation=torchvision.transforms.InterpolationMode.NEAREST)(env_info["sensor"][:n_envs])
+                    depth_image = (depth_image * 255).to(torch.uint8).unsqueeze(-1).expand(-1, -1, -1, 3).cpu().numpy()
+                    image = np.concatenate([rgb_image, depth_image], axis=-2)
+                else:
+                    image = rgb_image
+                if video_array is None:
+                    H, W = image.shape[1], image.shape[2]
+                    video_array = np.empty((n_envs, self.env.max_steps, H, W, 3), dtype=np.uint8)
                 video_array[index] = image
                 reset, success = env_info["reset"][:n_envs], env_info["success"][:n_envs]
                 if reset.sum().item() > success.sum().item(): # some episodes failed
