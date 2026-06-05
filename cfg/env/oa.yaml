@@ -31,9 +31,9 @@ loss_weights:
     pos: 5.
     collision: 0.
   quadrotor:
-    vel: 1.
-    oa: 1.
-    jerk: 1.
+    vel: 2.
+    oa: 5.
+    jerk: 0.02   # jerk_loss = |body_rate|; keep small so the policy can still rotate to translate/avoid
     pos: 5.
     collision: 0.
 

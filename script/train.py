@@ -9,6 +9,8 @@ from omegaconf import DictConfig, OmegaConf
 def allocate_device(cfg: DictConfig):
     hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
     multirun = hydra_cfg.mode == hydra.types.RunMode.MULTIRUN
+    if isinstance(cfg.device, str) and cfg.device == "mps":
+        return "mps", False
     use_multiple_devices = isinstance(cfg.device, str) and len(cfg.device) > 0
     multirun_across_devices = multirun and use_multiple_devices
     if multirun_across_devices:
@@ -28,20 +30,25 @@ def main(cfg: DictConfig):
         import os
         os.environ["CUDA_VISIBLE_DEVICES"] = str(job_device)
         cfg.device = 0
-    
+
     import torch
     torch.set_float32_matmul_precision('high') # for better performance
     import numpy as np
-    
+
     from diffaero.env import build_env
     from diffaero.algo import build_agent
     from diffaero.utils.logger import Logger
     from diffaero.utils.runner import TrainRunner
-    
+
     logger = Logger(cfg, run_name=cfg.runname)
-    
-    device = f"cuda:{cfg.device}" if torch.cuda.is_available() and cfg.device != -1 else "cpu"
-    device_repr = f"cuda:{job_device}" if multirun_across_devices and device != "cpu" else device
+
+    if job_device == "mps":
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+    elif torch.cuda.is_available() and job_device != -1:
+        device = f"cuda:{job_device}"
+    else:
+        device = "cpu"
+    device_repr = f"cuda:{job_device}" if multirun_across_devices else device
     Logger.info(f"Using device {device_repr}.")
     device = torch.device(device)
     

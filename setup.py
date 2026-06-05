@@ -3,8 +3,8 @@ from setuptools import setup, find_packages
 setup(
     name='diffaero',
     version='0.1',
-    # packages=find_packages(),
-    packages=[".", "env", "algo", "network", "utils", "script"],
+    package_dir={"diffaero": "."},
+    packages=["diffaero", "diffaero.env", "diffaero.algo", "diffaero.network", "diffaero.utils", "diffaero.script", "diffaero.dynamics"],
     install_requires=[
         'torch>=2.0.0',
         'tensordict',

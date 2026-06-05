@@ -20,7 +20,12 @@ def main(cfg: DictConfig):
     logger = Logger(cfg, run_name=cfg.runname)
 
     device_idx = cfg.device
-    device = f"cuda:{device_idx}" if torch.cuda.is_available() and device_idx != -1 else "cpu"
+    if isinstance(device_idx, str) and device_idx == "mps":
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+    elif torch.cuda.is_available() and device_idx != -1:
+        device = f"cuda:{device_idx}"
+    else:
+        device = "cpu"
     Logger.info(f"Using device {device}.")
     device = torch.device(device)
     

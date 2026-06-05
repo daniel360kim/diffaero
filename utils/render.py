@@ -155,11 +155,9 @@ class BaseRenderer:
         self.record_video: bool = cfg.record_video
         self.enable_rendering: bool = True
         self.headless = headless
-        self.device = device
-        
-        if self.record_video:
-            assert str(self.device) in ["cpu", "cuda:0"], "Video recording is only supported on cpu and cuda:0."
-        
+        # taichi's from_torch doesn't support MPS tensors; keep renderer on CPU when training on MPS
+        self.device = torch.device("cpu") if device.type == "mps" else device
+
         if "cpu" in str(self.device):
             Logger.info("Using CPU to render GUI.")
             ti.init(arch=ti.cpu)
@@ -430,9 +428,9 @@ class BaseRenderer:
     
     def _update_state(self, states_for_rendering: Dict[str, Tensor]):
         if self.enable_rendering:
-            pos = states_for_rendering["pos"]
-            quat_xyzw = states_for_rendering["quat_xyzw"]
-            target_pos = states_for_rendering["target_pos"]
+            pos = states_for_rendering["pos"].to(self.device)
+            quat_xyzw = states_for_rendering["quat_xyzw"].to(self.device)
+            target_pos = states_for_rendering["target_pos"].to(self.device)
             self._update_drone_pose(pos, quat_xyzw)
             self._update_camera_pose(pos, quat_xyzw, target_pos)
             self._update_lines(pos, target_pos)
@@ -702,12 +700,12 @@ class ObstacleAvoidanceRenderer(BaseRenderer):
     def _init_obstacles(self):
         if self.obstacle_manager.n_cubes > 0:
             # initialize meshes of the cubes
-            lwh = self.obstacle_manager.lwh_cubes[:self.n_envs]
+            lwh = self.obstacle_manager.lwh_cubes[:self.n_envs].to(self.device)
             xyz = torch.zeros_like(lwh)
             vertices_tensor, indices_tensor, color_tensor = add_box(
                 xyz=xyz,
-                lwh=self.obstacle_manager.lwh_cubes[:self.n_envs],
-                rpy=self.obstacle_manager.rpy_cubes[:self.n_envs],
+                lwh=lwh,
+                rpy=self.obstacle_manager.rpy_cubes[:self.n_envs].to(self.device),
                 color=torch.tensor([[self.cube_color]], device=self.device).expand_as(lwh)
             )
             self.cube_vertices_tensor.copy_(vertices_tensor)
@@ -718,10 +716,10 @@ class ObstacleAvoidanceRenderer(BaseRenderer):
         
         if self.obstacle_manager.n_spheres > 0:
             # initialize meshes of the spheres
-            xyz = torch.zeros_like(self.obstacle_manager.p_spheres[:self.n_envs])
+            xyz = torch.zeros(self.n_envs, self.obstacle_manager.n_spheres, 3, device=self.device)
             vertices_tensor, indices_tensor, color_tensor = add_sphere(
                 xyz=xyz,
-                radius=self.obstacle_manager.r_spheres[:self.n_envs],
+                radius=self.obstacle_manager.r_spheres[:self.n_envs].to(self.device),
                 lat_segments=self.sphere_n_segments,
                 lon_segments=self.sphere_n_segments * 2,
                 color=torch.tensor([[self.sphere_color]], device=self.device).expand_as(xyz)
@@ -738,7 +736,7 @@ class ObstacleAvoidanceRenderer(BaseRenderer):
             self._update_obstacles()
         nearest_points = states_for_rendering.get("nearest_points", None)
         if nearest_points is not None:
-            nearest_points_tensor = nearest_points[:self.n_envs] + self.env_origin.unsqueeze(-2) # [n_envs, n_obstacles, 3]
+            nearest_points_tensor = nearest_points[:self.n_envs].to(self.device) + self.env_origin.unsqueeze(-2) # [n_envs, n_obstacles, 3]
             self.nearest_points_field.from_torch(torch2ti(nearest_points_tensor.flatten(end_dim=-2)))
             self.nearest_points_field_one_env.from_torch(torch2ti(nearest_points_tensor[self.gui_states["tracking_env_idx"]].flatten(end_dim=-2)))
     
@@ -747,15 +745,15 @@ class ObstacleAvoidanceRenderer(BaseRenderer):
         idx = self.gui_states["tracking_env_idx"]
         cube_vertices_tensor, cube_indices_tensor, cube_color_tensor = add_box(
             xyz=torch.zeros(self.n_envs, self.obstacle_manager.n_cubes, 3, device=self.device),
-            lwh=self.obstacle_manager.lwh_cubes[:self.n_envs],
-            rpy=self.obstacle_manager.rpy_cubes[:self.n_envs],
+            lwh=self.obstacle_manager.lwh_cubes[:self.n_envs].to(self.device),
+            rpy=self.obstacle_manager.rpy_cubes[:self.n_envs].to(self.device),
             color=torch.tensor([[self.cube_color]], device=self.device).expand(self.n_envs, self.obstacle_manager.n_cubes, -1)
         )
         self.cube_vertices_tensor.copy_(cube_vertices_tensor)
-        
+
         cube_vertices_tensor = (
-            self.cube_vertices_tensor + 
-            self.obstacle_manager.p_cubes[:self.n_envs].unsqueeze(-2) + 
+            self.cube_vertices_tensor +
+            self.obstacle_manager.p_cubes[:self.n_envs].to(self.device).unsqueeze(-2) +
             self.env_origin.unsqueeze(-2).unsqueeze(-2))
 
         if self.enable_rendering:
@@ -766,17 +764,17 @@ class ObstacleAvoidanceRenderer(BaseRenderer):
         # update the pose of the spheres
         idx = self.gui_states["tracking_env_idx"]
         sphere_vertices_tensor, sphere_indices_tensor, sphere_color_tensor = add_sphere(
-            xyz=torch.zeros_like(self.obstacle_manager.p_spheres[:self.n_envs]),
-            radius=self.obstacle_manager.r_spheres[:self.n_envs],
+            xyz=torch.zeros(self.n_envs, self.obstacle_manager.n_spheres, 3, device=self.device),
+            radius=self.obstacle_manager.r_spheres[:self.n_envs].to(self.device),
             lat_segments=self.sphere_n_segments,
             lon_segments=self.sphere_n_segments * 2,
             color=torch.tensor([[self.sphere_color]], device=self.device).expand(self.n_envs, self.obstacle_manager.n_spheres, -1)
         )
         self.sphere_vertices_tensor.copy_(sphere_vertices_tensor)
-        
+
         sphere_vertices_tensor = (
             self.sphere_vertices_tensor +
-            self.obstacle_manager.p_spheres[:self.n_envs].unsqueeze(-2) + 
+            self.obstacle_manager.p_spheres[:self.n_envs].to(self.device).unsqueeze(-2) +
             self.env_origin.unsqueeze(-2).unsqueeze(-2)
         )
         

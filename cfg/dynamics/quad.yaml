@@ -74,4 +74,4 @@ controller:
   min_normed_torque: [-15., -15., -15.]
   max_normed_torque: [ 15.,  15.,  15.]
 
-  K_angvel: [1., 1., 1.]
+  K_angvel: [8., 8., 4.]

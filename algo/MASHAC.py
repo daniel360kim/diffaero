@@ -1,4 +1,3 @@
-from termios import N_SLIP
 from typing import Union, Sequence, Tuple, Dict, Optional
 from copy import deepcopy
 import os
