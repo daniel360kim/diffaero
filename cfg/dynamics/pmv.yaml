@@ -1,0 +1,51 @@
+name: velocity_pointmass
+abbr: pmv
+
+# Velocity-command point mass: the action is a velocity setpoint handed to
+# PX4's offboard velocity loop. Schema matches the pre-reorg pmv runs
+# (checkpoints/DiffAero/sha2c_vel_cmd*/.hydra/config.yaml) plus the
+# max_yaw_rate / yaw_hold_speed keys superfly's DiffAeroVelPolicy reads.
+
+n_envs: ${n_envs}
+n_agents: ${n_agents}
+dt: ${env.dt}
+action_frame: "local" # "world" or "local"
+action_is_velocity: True
+planar: False           # 3-dim action [vx, vy, vz]
+m: 1.0                  # total mass (unused by the kinematic model; schema compat)
+g: 9.81
+lmbda:                  # first-order velocity tracking lag rate [1/s]
+  default: 1.2
+  enabled: True
+  min: 0.5
+  max: 2.0
+alpha: 1.0              # gradient decay factor
+align_yaw_with_target_direction: False
+align_yaw_with_vel_ema: True
+vel_ema_factor:
+  default: 0.1
+  enabled: True
+  min: 0.08
+  max: 0.12
+
+max_vel:                # action clamp [m/s]
+  xy:
+    default: 5
+    enabled: True
+    min: 3
+    max: 8
+  z:
+    default: 3
+    enabled: True
+    min: 2
+    max: 5
+
+max_yaw_rate:           # yaw slew toward velocity EMA [deg/s]
+  default: 60
+  enabled: True
+  min: 45
+  max: 80
+yaw_hold_speed: 0.3     # hold yaw below this speed [m/s]
+
+solver_type: "rk4"      # unused (closed-form first-order lag); schema compat
+n_substeps: 1

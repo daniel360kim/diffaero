@@ -7,6 +7,7 @@ hydra-joblib-launcher
 hydra_colorlog
 hydra-optuna-sweeper
 welford_torch
+einops
 line_profiler
 tensorboard
 tensorboardX
@@ -23,3 +24,4 @@ imageio-ffmpeg
 matplotlib
 onnx
 onnxruntime
+onnxscript

@@ -60,7 +60,11 @@ class PolicyExporter(nn.Module):
         
         self.obs_frame: str
         self.action_frame: str
-    
+        # Set from export_cfg in export(): velocity-command actors return
+        # only the (world-frame, planar-padded) velocity setpoint.
+        self.action_is_velocity: bool = False
+        self.planar: bool = False
+
     def post_process_local(self, raw_action, min_action, max_action, orientation, Rz, is_stochastic):
         # type: (Tensor, Tensor, Tensor, Tensor, Tensor, bool) -> Tuple[Tensor, Tensor, Tensor]
         raw_action = raw_action.tanh() if is_stochastic else raw_action
@@ -104,6 +108,40 @@ class PolicyExporter(nn.Module):
         else:
             raise ValueError(f"Unknown action frame: {self.action_frame}")
     
+    def post_process_vel(self, raw_action, min_action, max_action, Rz):
+        # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
+        """Velocity-command post-process: rescale, pad vz=0 when planar,
+        rotate local->world. Matches superfly's DiffAeroVelPolicy, which
+        clamps/lags the returned world-frame setpoint itself."""
+        raw_action = raw_action.tanh() if self.is_stochastic else raw_action
+        action = (raw_action * 0.5 + 0.5) * (max_action - min_action) + min_action
+        if self.planar:
+            pad = torch.zeros(action.shape[0], 1, dtype=action.dtype, device=action.device)
+            action = torch.cat([action, pad], dim=-1)
+        if self.action_frame == "local":
+            action = torch.matmul(Rz, action.unsqueeze(-1)).squeeze(-1)
+        return action
+
+    def forward_MLP_vel(self, state, orientation, Rz, min_action, max_action):
+        # type: (Union[Tensor, Tuple[Tensor, Tensor]], Tensor, Tensor, Tensor, Tensor) -> Tensor
+        raw_action = self.actor.forward_export(state)
+        return self.post_process_vel(raw_action, min_action, max_action, Rz)
+
+    def forward_CNN_vel(self, state, perception, orientation, Rz, min_action, max_action):
+        # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) -> Tensor
+        raw_action = self.actor.forward_export(state=state, perception=perception)
+        return self.post_process_vel(raw_action, min_action, max_action, Rz)
+
+    def forward_RNN_vel(self, state, orientation, Rz, min_action, max_action, hidden_in):
+        # type: (Union[Tensor, Tuple[Tensor, Tensor]], Tensor, Tensor, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor]
+        raw_action, hidden_out = self.actor.forward_export(state, hidden=hidden_in)
+        return self.post_process_vel(raw_action, min_action, max_action, Rz), hidden_out
+
+    def forward_RCNN_vel(self, state, perception, orientation, Rz, min_action, max_action, hidden_in):
+        # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor]
+        raw_action, hidden_out = self.actor.forward_export(state=state, perception=perception, hidden=hidden_in)
+        return self.post_process_vel(raw_action, min_action, max_action, Rz), hidden_out
+
     def forward_MLP(self, state, orientation, Rz, min_action, max_action):
         # type: (Union[Tensor, Tuple[Tensor, Tensor]], Tensor, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor]
         raw_action = self.actor.forward_export(state)
@@ -136,6 +174,18 @@ class PolicyExporter(nn.Module):
     ):
         self.obs_frame = export_cfg.obs_frame
         self.action_frame = export_cfg.action_frame
+        self.action_is_velocity = bool(export_cfg.get("action_is_velocity", False))
+        self.planar = bool(export_cfg.get("planar", False))
+        if self.action_is_velocity:
+            if isinstance(self.actor, MLP):
+                self.forward = self.forward_MLP_vel
+            elif isinstance(self.actor, CNN):
+                self.forward = self.forward_CNN_vel
+            elif isinstance(self.actor, RNN):
+                self.forward = self.forward_RNN_vel
+            elif isinstance(self.actor, RCNN):
+                self.forward = self.forward_RCNN_vel
+            self.output_names = ["vel_cmd"] + (["hidden_out"] if self.is_recurrent else [])
         if export_cfg.jit:
             self.export_jit(path, verbose)
         if export_cfg.onnx:

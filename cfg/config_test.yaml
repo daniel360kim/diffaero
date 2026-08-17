@@ -35,6 +35,9 @@ checkpoint:
 export:
   obs_frame: ${env.obs_frame}
   action_frame: ${dynamics.action_frame}
+  # velocity-command actors (dynamics=pmv*) export a setpoint-only forward
+  action_is_velocity: ${oc.select:dynamics.action_is_velocity,false}
+  planar: ${oc.select:dynamics.planar,false}
   jit: True
   onnx: True
 

@@ -1,0 +1,56 @@
+name: velocity_pointmass
+abbr: pmv_planar
+
+# Planar velocity-command point mass for the ModalAI Starling 2 Max
+# low-speed deployment (superfly configs/vehicles/starling2max.yaml is the
+# vehicle source of truth; this config is about the PX4 velocity loop, not
+# the airframe). The policy outputs horizontal [vx, vy] only; altitude is
+# held by the deploy bridge (diffaero_vel_offboard.py altitude PID) and is
+# frozen in training. Cruise speeds come from the env's
+# min/max_target_vel (0.8-1.5 m/s for this campaign); the action clamp
+# below leaves dodge headroom above cruise, and its `default` is what the
+# deployed policy + PX4 MPC_XY_VEL_MAX get clamped to.
+
+n_envs: ${n_envs}
+n_agents: ${n_agents}
+dt: ${env.dt}
+action_frame: "local"
+action_is_velocity: True
+planar: True            # 2-dim action [vx, vy]; v_z == 0
+m: 1.0
+g: 9.81
+lmbda:                  # PX4 velocity-loop tracking lag [1/s]; randomized
+  default: 1.2          # wide because it is not sys-ID'd on the Starling
+  enabled: True
+  min: 0.5
+  max: 2.0
+alpha: 1.0
+align_yaw_with_target_direction: False
+align_yaw_with_vel_ema: True
+vel_ema_factor:
+  default: 0.1
+  enabled: True
+  min: 0.08
+  max: 0.12
+
+max_vel:
+  xy:                   # dodge headroom above the 0.8-1.5 m/s cruise band
+    default: 2.0
+    enabled: True
+    min: 1.5
+    max: 2.5
+  z:                    # unused by the planar action; deploy reads .default
+    default: 1.0        # for MPC_Z_VEL_MAX_* and the altitude-PID vz cap
+    enabled: False
+    min: 1.0
+    max: 1.0
+
+max_yaw_rate:
+  default: 60
+  enabled: True
+  min: 45
+  max: 80
+yaw_hold_speed: 0.3
+
+solver_type: "rk4"
+n_substeps: 1

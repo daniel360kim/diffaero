@@ -37,6 +37,13 @@ class ObstacleAvoidance(BaseEnv):
                 state_dim = 9
             elif self.obs_frame == "world":
                 state_dim = 10
+        elif self.dynamic_type == "pointmass_vel":
+            # [target_vel(3), v(3)] -- no attitude term: the velocity model
+            # flies level, so uz carries no information (deploy contract:
+            # DiffAeroVelPolicy builds exactly this 6-dim state).
+            assert self.obs_frame == "local", \
+                "pointmass_vel supports obs_frame=local only (deploy contract)"
+            state_dim = 6
         elif self.dynamic_type == "quadrotor":
             state_dim = 10
         if self.last_action_in_obs:
@@ -69,7 +76,7 @@ class ObstacleAvoidance(BaseEnv):
             self.target_pos - self.p,
             self.q,
             self._v,
-            self._a if self.dynamic_type == "pointmass" else self._w,
+            self._a if self.dynamic_type in ("pointmass", "pointmass_vel") else self._w,
         ], dim=-1)
         return state if with_grad else state.detach()
 
@@ -88,6 +95,8 @@ class ObstacleAvoidance(BaseEnv):
                 self.dynamics.uz if self.obs_frame == "local" else self.q,
                 _v,
             ], dim=-1)
+        elif self.dynamic_type == "pointmass_vel":
+            obs = torch.cat([target_vel, _v], dim=-1)
         else:
             obs = torch.cat([target_vel, self._q, _v], dim=-1)
         if self.last_action_in_obs:
@@ -178,8 +187,54 @@ class ObstacleAvoidance(BaseEnv):
         
         collision_loss = self.collision().float()
         arrive_loss = 1 - torch.norm(self.p - self.target_pos, dim=-1).lt(0.5).float()
-        
-        if self.dynamic_type == "pointmass":
+
+        if self.dynamic_type == "pointmass_vel":
+            # Velocity-command variant of the pointmass loss (reuses the
+            # pointmass weight group, as the pre-reorg pmv runs did). The
+            # jerk analog penalizes velocity commands far from the achieved
+            # velocity -- the same shape as pmc's a_thrust-vs-action term.
+            pos_loss = 1 - (-(self._p - self.target_pos).norm(dim=-1)).exp()
+
+            vel_diff = torch.norm(self.dynamics._vel_ema - self.target_vel, dim=-1)
+            vel_loss = F.smooth_l1_loss(vel_diff, torch.zeros_like(vel_diff), reduction="none")
+            z_loss = 1 - (-(self._p[..., 2] - self.target_pos[..., 2]).abs()).exp()
+
+            if self.dynamics.planar:
+                action = torch.cat([action, torch.zeros_like(action[..., :1])], dim=-1)
+            if self.dynamics.action_frame == "local":
+                action = self.dynamics.local2world(action)
+            jerk_loss = F.mse_loss(self.dynamics.v, action, reduction="none").sum(dim=-1) + \
+                        F.mse_loss(torch.norm(self.dynamics.v, dim=-1), torch.norm(action, dim=-1), reduction="none") * 5
+            total_loss = (
+                self.loss_weights.pointmass.vel * vel_loss +
+                self.loss_weights.pointmass.z * z_loss +
+                self.loss_weights.pointmass.oa * oa_loss +
+                self.loss_weights.pointmass.jerk * jerk_loss +
+                self.loss_weights.pointmass.pos * pos_loss +
+                self.loss_weights.pointmass.collision * collision_loss
+            )
+            total_reward = (
+                self.reward_weights.constant -
+                self.reward_weights.pointmass.z * z_loss -
+                self.reward_weights.pointmass.vel * vel_loss -
+                self.reward_weights.pointmass.oa * oa_loss -
+                self.reward_weights.pointmass.jerk * jerk_loss -
+                self.reward_weights.pointmass.pos * pos_loss -
+                self.reward_weights.pointmass.arrive * arrive_loss -
+                self.reward_weights.pointmass.collision * collision_loss
+            ).detach()
+            loss_components = {
+                "vel_loss": vel_loss.mean().item(),
+                "z_loss": z_loss.mean().item(),
+                "pos_loss": pos_loss.mean().item(),
+                "arrive_loss": arrive_loss.mean().item(),
+                "jerk_loss": jerk_loss.mean().item(),
+                "collision_loss": collision_loss.mean().item(),
+                "oa_loss": oa_loss.mean().item(),
+                "total_loss": total_loss.mean().item(),
+                "total_reward": total_reward.mean().item()
+            }
+        elif self.dynamic_type == "pointmass":
             pos_loss = 1 - (-(self._p-self.target_pos).norm(dim=-1)).exp()
             
             vel_diff = torch.norm(self.dynamics._vel_ema - self.target_vel, dim=-1)
@@ -274,15 +329,23 @@ class ObstacleAvoidance(BaseEnv):
             new_state[:, 6] = 1 # real part of the quaternion
         elif self.dynamic_type == "pointmass":
             new_state[:, -1] = 9.8
+        # pointmass_vel: state is [p, v]; zero velocity init needs no patching
         self.dynamics._state = torch.where(state_mask, new_state, self.dynamics._state)
         self.dynamics.reset_idx(env_idx)
         
         # min_init_dist = 1.2 * self.L
-        min_init_dist = ( # [n_envs, 1]
-            ((xy_max - xy_min - 1) / 2) ** 2 + 
-            ((xy_max - xy_min - 1) / 2) ** 2 + 
-            ((z_max - z_min - 1) / 2) ** 2
-        ) ** 0.5
+        if self.dynamic_type == "pointmass_vel" and self.dynamics.planar:
+            # Targets are flattened to the drone's spawn altitude below, so
+            # the 3-D half-diagonal is unreachable from a centered spawn
+            # (max planar distance ~= sqrt(2) * half-span). Half the XY span
+            # is achievable from anywhere in the box.
+            min_init_dist = (xy_max - xy_min - 1) / 2  # [n_envs, 1]
+        else:
+            min_init_dist = ( # [n_envs, 1]
+                ((xy_max - xy_min - 1) / 2) ** 2 +
+                ((xy_max - xy_min - 1) / 2) ** 2 +
+                ((z_max - z_min - 1) / 2) ** 2
+            ) ** 0.5
         # randomly select a target position that meets the minimum distance constraint
         N = 10
         linspace = torch.linspace(0, 1, N, device=self.device).unsqueeze(0)
@@ -297,6 +360,12 @@ class ObstacleAvoidance(BaseEnv):
             y[env_idx].reshape(-1, 1, N, 1).expand(-1, N,-1, N),
             z[env_idx].reshape(-1, 1, 1, N).expand(-1, N, N,-1)
         ], dim=-1).reshape(-1, N**3, 3).gather(dim=1, index=random_idx)
+        if self.dynamic_type == "pointmass_vel" and self.dynamics.planar:
+            # Planar policies cannot change altitude: flatten every target
+            # candidate to the drone's spawn altitude BEFORE the validity
+            # check so the min-distance constraint holds for the actual
+            # (same-altitude) target.
+            xyz[..., 2] = self.p[env_idx, None, 2]
         valid = torch.gt((xyz - self.p[env_idx, None, :]).norm(dim=-1), min_init_dist[env_idx])
         
         valid_points = valid.nonzero()
@@ -307,6 +376,12 @@ class ObstacleAvoidance(BaseEnv):
         self.target_pos[env_idx] = xyz[chosen_points[:, 0], chosen_points[:, 1]]
         # check that all regenerated initial and target positions meet the minimal distance contraint
         assert torch.all(((self.p - self.target_pos).norm(dim=-1) > min_init_dist.squeeze(-1))[env_idx]).item()
+
+        if self.dynamic_type == "pointmass_vel":
+            # Start each episode facing its target, matching the deploy YAW
+            # phase that hands over to the policy already goal-facing.
+            rel = self.target_pos[env_idx] - self.p[env_idx]
+            self.dynamics.set_yaw(env_idx, torch.atan2(rel[:, 1], rel[:, 0]))
         
         # randomize obstacles sizes, poses and positions
         self.obstacle_manager.randomize_obstacles(
