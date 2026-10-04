@@ -44,6 +44,9 @@ class ObstacleAvoidance(BaseEnv):
             assert self.obs_frame == "local", \
                 "pointmass_vel supports obs_frame=local only (deploy contract)"
             state_dim = 6
+            if self.dynamics.yaw_rate_action:
+                # + measured yaw rate: the policy commands it through a lag
+                state_dim = 7
         elif self.dynamic_type == "quadrotor":
             state_dim = 10
         if self.last_action_in_obs:
@@ -66,6 +69,22 @@ class ObstacleAvoidance(BaseEnv):
         
         self.r_drone: float = cfg.r_drone
         self.obstacle_nearest_points = torch.empty(self.n_envs, self.n_obstacles, 3, device=device)
+
+        # Observation noise: corrupts only what the policy sees (never the
+        # loss, the critic state or the dynamics). Values are placeholders
+        # until they are fitted from PX4 ulogs; off unless obs_noise.enabled.
+        noise_cfg = cfg.get("obs_noise", None)
+        self.obs_noise_enabled: bool = noise_cfg is not None and bool(noise_cfg.enabled)
+        if self.obs_noise_enabled:
+            self.noise_vel_std = float(noise_cfg.vel_std)
+            self.noise_vel_bias_std = float(noise_cfg.vel_bias_std)
+            self.noise_yaw_rate_std = float(noise_cfg.yaw_rate_std)
+            self.noise_pos_std = float(noise_cfg.pos_std)
+            self.noise_pos_bias_std = float(noise_cfg.pos_bias_std)
+            self.noise_depth_std_rel = float(noise_cfg.depth_std_rel)
+            self.noise_depth_dropout = float(noise_cfg.depth_dropout)
+            self.vel_bias = torch.zeros(self.n_envs, 3, device=device)
+            self.pos_bias = torch.zeros(self.n_envs, 3, device=device)
     
     @timeit
     def get_state(self, with_grad=False):
@@ -80,14 +99,36 @@ class ObstacleAvoidance(BaseEnv):
         ], dim=-1)
         return state if with_grad else state.detach()
 
+    def _noisy_target_vel(self) -> Tensor:
+        """target_vel from a noisy position estimate (same clamp as BaseEnv.target_vel)."""
+        p_est = self.p + self.pos_bias + torch.randn_like(self.pos_bias) * self.noise_pos_std
+        target_relpos = self.target_pos - p_est
+        target_dist = target_relpos.norm(dim=-1)
+        return target_relpos / torch.max(target_dist / self.max_vel, torch.ones_like(target_dist)).unsqueeze(-1)
+
+    def _noisy_perception(self) -> Tensor:
+        """Depth is encoded 1 - d/max_dist: multiplicative range noise, and
+        dropped pixels read 0 (no return == far), as stereo holes do."""
+        depth = self.sensor_tensor.clone()
+        if self.noise_depth_std_rel > 0:
+            d = (1. - depth) * (1. + torch.randn_like(depth) * self.noise_depth_std_rel)
+            depth = (1. - d).clamp(0., 1.)
+        if self.noise_depth_dropout > 0:
+            depth = torch.where(torch.rand_like(depth) < self.noise_depth_dropout, 0., depth)
+        return depth
+
     @timeit
     def get_observations(self, with_grad=False):
+        target_vel_w = self._noisy_target_vel() if self.obs_noise_enabled else self.target_vel
+        _v_w = self._v
+        if self.obs_noise_enabled:
+            _v_w = _v_w + self.vel_bias + torch.randn_like(self.vel_bias) * self.noise_vel_std
         if self.obs_frame == "local":
-            target_vel = self.dynamics.world2local(self.target_vel)
-            _v = self.dynamics.world2local(self._v)
+            target_vel = self.dynamics.world2local(target_vel_w)
+            _v = self.dynamics.world2local(_v_w)
         elif self.obs_frame == "world":
-            target_vel = self.target_vel
-            _v = self._v
+            target_vel = target_vel_w
+            _v = _v_w
         
         if self.dynamic_type == "pointmass":
             obs = torch.cat([
@@ -97,12 +138,18 @@ class ObstacleAvoidance(BaseEnv):
             ], dim=-1)
         elif self.dynamic_type == "pointmass_vel":
             obs = torch.cat([target_vel, _v], dim=-1)
+            if self.dynamics.yaw_rate_action:
+                yaw_rate = self.dynamics.yaw_rate.unsqueeze(-1)
+                if self.obs_noise_enabled:
+                    yaw_rate = yaw_rate + torch.randn_like(yaw_rate) * self.noise_yaw_rate_std
+                obs = torch.cat([obs, yaw_rate], dim=-1)
         else:
             obs = torch.cat([target_vel, self._q, _v], dim=-1)
         if self.last_action_in_obs:
             obs = torch.cat([obs, self.last_action], dim=-1)
+        perception = self._noisy_perception() if self.obs_noise_enabled else self.sensor_tensor.clone()
         obs = TensorDict({
-            "state": obs, "perception": self.sensor_tensor.clone()}, batch_size=self.n_envs)
+            "state": obs, "perception": perception}, batch_size=self.n_envs)
         obs = obs if with_grad else obs.detach()
         return obs
     
@@ -199,13 +246,21 @@ class ObstacleAvoidance(BaseEnv):
             vel_loss = F.smooth_l1_loss(vel_diff, torch.zeros_like(vel_diff), reduction="none")
             z_loss = 1 - (-(self._p[..., 2] - self.target_pos[..., 2]).abs()).exp()
 
+            yaw_rate_loss = torch.zeros_like(pos_loss)
+            if self.dynamics.yaw_rate_action:
+                # [vx, vz, yaw_rate] -> local velocity [vx, 0, vz]; the yaw-rate
+                # command gets its own effort penalty (no velocity analog).
+                yaw_rate_loss = action[..., 2] ** 2
+                action = torch.stack([action[..., 0], torch.zeros_like(action[..., 0]), action[..., 1]], dim=-1)
             if self.dynamics.planar:
                 action = torch.cat([action, torch.zeros_like(action[..., :1])], dim=-1)
             if self.dynamics.action_frame == "local":
                 action = self.dynamics.local2world(action)
             jerk_loss = F.mse_loss(self.dynamics.v, action, reduction="none").sum(dim=-1) + \
                         F.mse_loss(torch.norm(self.dynamics.v, dim=-1), torch.norm(action, dim=-1), reduction="none") * 5
+            w_yaw_rate = self.loss_weights.pointmass.get("yaw_rate", 0.)
             total_loss = (
+                w_yaw_rate * yaw_rate_loss +
                 self.loss_weights.pointmass.vel * vel_loss +
                 self.loss_weights.pointmass.z * z_loss +
                 self.loss_weights.pointmass.oa * oa_loss +
@@ -215,6 +270,7 @@ class ObstacleAvoidance(BaseEnv):
             )
             total_reward = (
                 self.reward_weights.constant -
+                self.reward_weights.pointmass.get("yaw_rate", 0.) * yaw_rate_loss -
                 self.reward_weights.pointmass.z * z_loss -
                 self.reward_weights.pointmass.vel * vel_loss -
                 self.reward_weights.pointmass.oa * oa_loss -
@@ -229,6 +285,7 @@ class ObstacleAvoidance(BaseEnv):
                 "pos_loss": pos_loss.mean().item(),
                 "arrive_loss": arrive_loss.mean().item(),
                 "jerk_loss": jerk_loss.mean().item(),
+                "yaw_rate_loss": yaw_rate_loss.mean().item(),
                 "collision_loss": collision_loss.mean().item(),
                 "oa_loss": oa_loss.mean().item(),
                 "total_loss": total_loss.mean().item(),
@@ -381,7 +438,16 @@ class ObstacleAvoidance(BaseEnv):
             # Start each episode facing its target, matching the deploy YAW
             # phase that hands over to the policy already goal-facing.
             rel = self.target_pos[env_idx] - self.p[env_idx]
-            self.dynamics.set_yaw(env_idx, torch.atan2(rel[:, 1], rel[:, 0]))
+            yaw0 = torch.atan2(rel[:, 1], rel[:, 0])
+            if self.dynamics.yaw_rate_action and self.dynamics.init_yaw_jitter_deg > 0:
+                jitter = torch.deg2rad(torch.tensor(self.dynamics.init_yaw_jitter_deg, device=self.device))
+                yaw0 = yaw0 + (torch.rand_like(yaw0) * 2 - 1) * jitter
+            self.dynamics.set_yaw(env_idx, yaw0)
+
+        if self.obs_noise_enabled:
+            # per-episode estimator biases
+            self.vel_bias[env_idx] = torch.randn(n_resets, 3, device=self.device) * self.noise_vel_bias_std
+            self.pos_bias[env_idx] = torch.randn(n_resets, 3, device=self.device) * self.noise_pos_bias_std
         
         # randomize obstacles sizes, poses and positions
         self.obstacle_manager.randomize_obstacles(

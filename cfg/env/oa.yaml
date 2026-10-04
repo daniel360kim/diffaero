@@ -30,6 +30,7 @@ loss_weights:
     jerk: 0.01
     pos: 5.
     collision: 0.
+    yaw_rate: 0.05  # vx_vz_yawrate only: penalty on the yaw-rate command [rad/s]^2
   quadrotor:
     vel: 2.
     oa: 5.
@@ -59,12 +60,26 @@ reward_weights:
     pos: 0.
     arrive: 1.
     collision: 50.
+    yaw_rate: 0.01  # vx_vz_yawrate only
   quadrotor:
     vel: 1.
     oa: 1.
     jerk: 1.
     pos: 5.
     collision: 50.
+
+# Observation noise on what the policy sees (never the loss or the critic).
+# Placeholder magnitudes until fitted from PX4 ulogs; see superfly
+# docs/DIFFAERO_YAWRATE.md for the ulog topic each field comes from.
+obs_noise:
+  enabled: False
+  vel_std: 0.05        # white noise on the velocity estimate [m/s], per axis
+  vel_bias_std: 0.02   # per-episode constant velocity bias [m/s]
+  yaw_rate_std: 0.02   # white noise on the yaw-rate estimate [rad/s]
+  pos_std: 0.05        # white noise on the position estimate (goal vector) [m]
+  pos_bias_std: 0.10   # per-episode constant position bias [m]
+  depth_std_rel: 0.02  # multiplicative range noise, fraction of the range
+  depth_dropout: 0.01  # probability a depth pixel has no return (reads far)
 
 enable_grid: False
 defaults:

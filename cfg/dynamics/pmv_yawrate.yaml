@@ -1,0 +1,71 @@
+name: velocity_pointmass
+abbr: pmv_yawrate
+
+# Non-holonomic velocity-command point mass: the policy outputs
+# [vx, vz, yaw_rate] in the yaw-local frame -- forward velocity, up
+# velocity and a yaw-rate command. There is no lateral velocity command,
+# so the forward depth camera always faces the commanded motion. The
+# deploy bridge rotates [vx, 0, vz] by the measured heading and sends
+# velocity + yaw-rate setpoints to PX4 offboard.
+#
+# Defaults are the Starling 2 Max low-speed campaign (cruise 0.8-1.5 m/s
+# from env.min/max_target_vel); the 0.5-2.0 and 2-5 m/s policies override
+# max_vel.x / max_vel.z / max_yaw_rate (superfly scripts/train_diffaero_yawrate.sh).
+# Every lag below is a placeholder until it is sys-ID'd from PX4 ulogs.
+
+n_envs: ${n_envs}
+n_agents: ${n_agents}
+dt: ${env.dt}
+action_frame: "local"   # vx_vz_yawrate is yaw-local by definition
+action_is_velocity: True
+action_space: "vx_vz_yawrate"
+planar: False
+m: 1.0
+g: 9.81
+lmbda:                  # PX4 velocity-loop tracking lag [1/s]
+  default: 1.2
+  enabled: True
+  min: 0.5
+  max: 2.0
+lmbda_yaw:              # yaw-rate tracking lag [1/s]; PX4's rate loop is fast,
+  default: 6.0          # the deploy bridge applies this same lag in software
+  enabled: True
+  min: 4.0
+  max: 10.0
+alpha: 1.0
+align_yaw_with_target_direction: False
+align_yaw_with_vel_ema: False   # yaw is commanded, not slewed
+vel_ema_factor:
+  default: 0.1
+  enabled: True
+  min: 0.08
+  max: 0.12
+
+max_vel:
+  x:                    # forward clamp [m/s]: dodge headroom above cruise
+    default: 2.0
+    enabled: True
+    min: 1.5
+    max: 2.5
+  z:                    # up/down clamp [m/s]
+    default: 1.0
+    enabled: True
+    min: 0.8
+    max: 1.2
+  xy:                   # unused by vx_vz_yawrate; schema compat with pmv
+    default: 2.0
+    enabled: False
+    min: 2.0
+    max: 2.0
+reverse_vel_x: 0.5      # vx lower bound is -reverse_vel_x (brake / back off a little)
+
+max_yaw_rate:           # yaw-rate action clamp [deg/s]
+  default: 60
+  enabled: True
+  min: 45
+  max: 80
+yaw_hold_speed: 0.3     # unused by vx_vz_yawrate; schema compat
+init_yaw_jitter_deg: 30 # uniform heading error added to the goal-facing start
+
+solver_type: "rk4"
+n_substeps: 1

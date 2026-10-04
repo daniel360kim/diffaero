@@ -38,6 +38,7 @@ export:
   # velocity-command actors (dynamics=pmv*) export a setpoint-only forward
   action_is_velocity: ${oc.select:dynamics.action_is_velocity,false}
   planar: ${oc.select:dynamics.planar,false}
+  action_space: ${oc.select:dynamics.action_space,''}
   jit: True
   onnx: True
 

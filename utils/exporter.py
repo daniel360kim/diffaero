@@ -64,6 +64,7 @@ class PolicyExporter(nn.Module):
         # only the (world-frame, planar-padded) velocity setpoint.
         self.action_is_velocity: bool = False
         self.planar: bool = False
+        self.yaw_rate_action: bool = False
 
     def post_process_local(self, raw_action, min_action, max_action, orientation, Rz, is_stochastic):
         # type: (Tensor, Tensor, Tensor, Tensor, Tensor, bool) -> Tuple[Tensor, Tensor, Tensor]
@@ -115,6 +116,14 @@ class PolicyExporter(nn.Module):
         clamps/lags the returned world-frame setpoint itself."""
         raw_action = raw_action.tanh() if self.is_stochastic else raw_action
         action = (raw_action * 0.5 + 0.5) * (max_action - min_action) + min_action
+        if self.yaw_rate_action:
+            # [vx, vz, yaw_rate] -> [vx_w, vy_w, vz_w, yaw_rate]: the local
+            # velocity [vx, 0, vz] rotated by the measured heading, plus the
+            # yaw-rate command [rad/s, ENU/FLU, + = CCW] passed through.
+            zero = torch.zeros_like(action[:, :1])
+            vel_l = torch.cat([action[:, :1], zero, action[:, 1:2]], dim=-1)
+            vel_w = torch.matmul(Rz, vel_l.unsqueeze(-1)).squeeze(-1)
+            return torch.cat([vel_w, action[:, 2:3]], dim=-1)
         if self.planar:
             pad = torch.zeros(action.shape[0], 1, dtype=action.dtype, device=action.device)
             action = torch.cat([action, pad], dim=-1)
@@ -176,6 +185,7 @@ class PolicyExporter(nn.Module):
         self.action_frame = export_cfg.action_frame
         self.action_is_velocity = bool(export_cfg.get("action_is_velocity", False))
         self.planar = bool(export_cfg.get("planar", False))
+        self.yaw_rate_action = str(export_cfg.get("action_space", "")) == "vx_vz_yawrate"
         if self.action_is_velocity:
             if isinstance(self.actor, MLP):
                 self.forward = self.forward_MLP_vel
@@ -185,7 +195,8 @@ class PolicyExporter(nn.Module):
                 self.forward = self.forward_RNN_vel
             elif isinstance(self.actor, RCNN):
                 self.forward = self.forward_RCNN_vel
-            self.output_names = ["vel_cmd"] + (["hidden_out"] if self.is_recurrent else [])
+            vel_name = "vel_yawrate_cmd" if self.yaw_rate_action else "vel_cmd"
+            self.output_names = [vel_name] + (["hidden_out"] if self.is_recurrent else [])
         if export_cfg.jit:
             self.export_jit(path, verbose)
         if export_cfg.onnx:
@@ -204,11 +215,22 @@ class PolicyExporter(nn.Module):
     def export_onnx(self, path: str):
         export_path = os.path.join(path, "exported_actor.onnx")
         names, test_inputs = zip(*self.named_inputs)
+        # An MLP with perception takes state as a (state, perception) tuple,
+        # which ONNX flattens to two inputs; name both, or every later name
+        # shifts by one (torch>=2.9's dynamo exporter rejects the resulting
+        # duplicate "max_action" outright).
+        flat_names: List[str] = []
+        for name, inp in self.named_inputs:
+            if isinstance(inp, tuple):
+                flat_names.extend(["state", "perception"] if name == "state" and len(inp) == 2
+                                  else [f"{name}_{i}" for i in range(len(inp))])
+            else:
+                flat_names.append(name)
         torch.onnx.export(
             model=self,
             args=test_inputs,
             f=export_path,
-            input_names=names,
+            input_names=flat_names,
             output_names=self.output_names
         )
         Logger.info(f"The checkpoint is compiled and exported to {export_path}.")
