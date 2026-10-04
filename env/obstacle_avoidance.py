@@ -68,6 +68,10 @@ class ObstacleAvoidance(BaseEnv):
             self.renderer = None
         
         self.r_drone: float = cfg.r_drone
+        # Leaving the arena is a truncation upstream (bootstrapped by the
+        # critic, i.e. free); with oob_terminates it ends the episode with the
+        # collision penalty instead. Off by default (upstream behaviour).
+        self.oob_terminates: bool = bool(cfg.get("oob_terminates", False))
         self.obstacle_nearest_points = torch.empty(self.n_envs, self.n_obstacles, 3, device=device)
 
         # Observation noise: corrupts only what the policy sees (never the
@@ -232,7 +236,7 @@ class ObstacleAvoidance(BaseEnv):
         avoiding_reward = avoiding_reward[torch.arange(self.n_envs, device=self.device), most_dangerous] # [n_envs]
         oa_loss = approaching_penalty - 0.5 * avoiding_reward
         
-        collision_loss = self.collision().float()
+        collision_loss = self.terminated().float()  # == collision() unless oob_terminates
         arrive_loss = 1 - torch.norm(self.p - self.target_pos, dim=-1).lt(0.5).float()
 
         if self.dynamic_type == "pointmass_vel":
@@ -247,7 +251,16 @@ class ObstacleAvoidance(BaseEnv):
             z_loss = 1 - (-(self._p[..., 2] - self.target_pos[..., 2]).abs()).exp()
 
             yaw_rate_loss = torch.zeros_like(pos_loss)
+            heading_loss = torch.zeros_like(pos_loss)
             if self.dynamics.yaw_rate_action:
+                # Point the nose (and camera) at the goal: yaw is differentiable
+                # in this model, so this reaches the yaw-rate action within a few
+                # steps, where the velocity losses only reach it through two lags.
+                # Faded out within 1 m horizontally, where the bearing is ill-defined.
+                rel = (self.target_pos - self.p)[..., :2]
+                bearing = torch.atan2(rel[..., 1], rel[..., 0])
+                heading_loss = (1 - torch.cos(self.dynamics._state[..., 6] - bearing)) * \
+                    rel.norm(dim=-1).clamp(max=1.)
                 # [vx, vz, yaw_rate] -> local velocity [vx, 0, vz]; the yaw-rate
                 # command gets its own effort penalty (no velocity analog).
                 yaw_rate_loss = action[..., 2] ** 2
@@ -259,8 +272,10 @@ class ObstacleAvoidance(BaseEnv):
             jerk_loss = F.mse_loss(self.dynamics.v, action, reduction="none").sum(dim=-1) + \
                         F.mse_loss(torch.norm(self.dynamics.v, dim=-1), torch.norm(action, dim=-1), reduction="none") * 5
             w_yaw_rate = self.loss_weights.pointmass.get("yaw_rate", 0.)
+            w_heading = self.loss_weights.pointmass.get("heading", 0.)
             total_loss = (
                 w_yaw_rate * yaw_rate_loss +
+                w_heading * heading_loss +
                 self.loss_weights.pointmass.vel * vel_loss +
                 self.loss_weights.pointmass.z * z_loss +
                 self.loss_weights.pointmass.oa * oa_loss +
@@ -271,6 +286,7 @@ class ObstacleAvoidance(BaseEnv):
             total_reward = (
                 self.reward_weights.constant -
                 self.reward_weights.pointmass.get("yaw_rate", 0.) * yaw_rate_loss -
+                self.reward_weights.pointmass.get("heading", 0.) * heading_loss -
                 self.reward_weights.pointmass.z * z_loss -
                 self.reward_weights.pointmass.vel * vel_loss -
                 self.reward_weights.pointmass.oa * oa_loss -
@@ -286,6 +302,7 @@ class ObstacleAvoidance(BaseEnv):
                 "arrive_loss": arrive_loss.mean().item(),
                 "jerk_loss": jerk_loss.mean().item(),
                 "yaw_rate_loss": yaw_rate_loss.mean().item(),
+                "heading_loss": heading_loss.mean().item(),
                 "collision_loss": collision_loss.mean().item(),
                 "oa_loss": oa_loss.mean().item(),
                 "total_loss": total_loss.mean().item(),
@@ -474,16 +491,22 @@ class ObstacleAvoidance(BaseEnv):
         
         return collision
     
-    def terminated(self) -> Tensor:
-        return self.collision()
-    
-    def truncated(self) -> torch.Tensor:
+    def out_of_bound(self) -> Tensor:
         x_range = 1.5 * self.L.value
         y_range = 1.5 * self.L.value
         z_range = self.L.value * self.height_scale
         range = torch.stack([x_range, y_range, z_range], dim=-1)
-        out_of_bound = torch.any(self.p < -range, dim=-1) | torch.any(self.p > range, dim=-1)
-        return (self.progress >= self.max_steps) | out_of_bound
+        return torch.any(self.p < -range, dim=-1) | torch.any(self.p > range, dim=-1)
+
+    def terminated(self) -> Tensor:
+        if self.oob_terminates:
+            return self.collision() | self.out_of_bound()
+        return self.collision()
+    
+    def truncated(self) -> torch.Tensor:
+        if self.oob_terminates:
+            return self.progress >= self.max_steps
+        return (self.progress >= self.max_steps) | self.out_of_bound()
 
     def export_obs_fn(self, path):
         class ObsFn(nn.Module):

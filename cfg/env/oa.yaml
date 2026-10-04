@@ -21,6 +21,7 @@ last_action_in_obs: False
 r_drone: 0.2
 n_obstacles: 30
 ground_plane: True
+oob_terminates: False  # True: leaving the arena = collision (terminal, penalized), not a free truncation
 
 loss_weights:
   pointmass:
@@ -31,6 +32,7 @@ loss_weights:
     pos: 5.
     collision: 0.
     yaw_rate: 0.05  # vx_vz_yawrate only: penalty on the yaw-rate command [rad/s]^2
+    heading: 1.     # vx_vz_yawrate only: 1 - cos(yaw - bearing to goal)
   quadrotor:
     vel: 2.
     oa: 5.
@@ -61,6 +63,7 @@ reward_weights:
     arrive: 1.
     collision: 50.
     yaw_rate: 0.01  # vx_vz_yawrate only
+    heading: 0.     # vx_vz_yawrate only
   quadrotor:
     vel: 1.
     oa: 1.
