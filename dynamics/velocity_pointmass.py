@@ -40,6 +40,18 @@ class VelocityPointMassModel(BaseDynamics):
     deploy bridge does with the measured heading before sending a world-
     frame setpoint to PX4 -- and then lags in the world frame as above.
 
+    plant="px4_fit" (vx_vz_yawrate only) replaces that first-order lag with
+    the velocity loop refitted to PX4 flying the real Starling 2 Max USD in
+    Isaac (superfly_expert_sampler wt/v8-chunk scripts/fit_px4_plant.py, 40
+    trials; constants in its sim_episode.py PX4_*): the command is delayed
+    delay_steps env steps, its horizontal part scaled by gain_xy, then
+    a_cmd = kv (v_sp - v), clamped like the sampler's clamp_command
+    (|a_xy| <= a_xy_max, |a + g| in [thrust_min, thrust_max]), reaches the
+    vehicle through a first-order acceleration lag acc_lag_s, integrated at
+    n_substeps per env step. The yaw-rate command shares the delay. The
+    acceleration is state (self._acc), carried with gradient. This model IS
+    PX4's response, so the deploy bridge sends setpoints with no software lag.
+
     solver_type / n_substeps are accepted for config-schema compatibility
     but unused: the model integrates in closed form (exact first-order lag
     + trapezoidal position update) once per step.
@@ -87,6 +99,23 @@ class VelocityPointMassModel(BaseDynamics):
             # Episodes start goal-facing (deploy YAW phase) plus this much
             # uniform heading error, so the policy learns to turn toward the goal.
             self.init_yaw_jitter_deg: float = float(cfg.get("init_yaw_jitter_deg", 0.))
+        self.plant: str = str(cfg.get("plant", "first_order"))
+        assert self.plant in ["first_order", "px4_fit"], f"Invalid plant: {self.plant}"
+        if self.plant == "px4_fit":
+            assert self.yaw_rate_action, "plant=px4_fit is implemented for action_space=vx_vz_yawrate"
+            pc = cfg.px4_fit
+            self.px4_kv = build_randomizer(pc.kv, [self.n_envs, 1], device=device)
+            self.px4_gain_xy = build_randomizer(pc.gain_xy, [self.n_envs, 1], device=device)
+            self.px4_acc_lag = build_randomizer(pc.acc_lag_s, [self.n_envs, 1], device=device)
+            self.px4_delay = build_randomizer(pc.delay_steps, [self.n_envs], device=device)
+            self.px4_max_delay = int(round(float(pc.delay_steps.max if pc.delay_steps.enabled
+                                                 else pc.delay_steps.default)))
+            self.px4_a_xy_max = float(pc.a_xy_max)
+            self.px4_thrust_min = float(pc.thrust_min)
+            self.px4_thrust_max = float(pc.thrust_max)
+            self.n_substeps = max(1, int(cfg.n_substeps))
+            # [max_delay + 1, n_envs, 4]: newest first; rows are [v_cmd_world(3), yaw_rate_cmd]
+            self._cmd_buf = torch.zeros(self.px4_max_delay + 1, self.n_envs, 4, device=device)
 
     @property
     def min_action(self) -> Tensor:
@@ -116,6 +145,8 @@ class VelocityPointMassModel(BaseDynamics):
         super().detach()
         self._vel_ema.detach_()
         self._acc.detach_()
+        if self.plant == "px4_fit":
+            self._cmd_buf = self._cmd_buf.detach()
 
     @property
     def yaw(self) -> Tensor:
@@ -181,6 +212,9 @@ class VelocityPointMassModel(BaseDynamics):
         self._vel_ema = torch.where(mask3, 0., self._vel_ema)
         self._acc = torch.where(mask3, 0., self._acc)
         self._yaw = torch.where(mask, 0., self._yaw)
+        if self.plant == "px4_fit":
+            # hover command in flight before the handover
+            self._cmd_buf = torch.where(mask[None, :, None], 0., self._cmd_buf)
 
     def step(self, U: Tensor) -> None:
         if self.yaw_rate_action:
@@ -216,6 +250,8 @@ class VelocityPointMassModel(BaseDynamics):
         yaw, r = self._state[..., 6], self._state[..., 7]
         # rotate by the (differentiable) heading at command time
         v_cmd = torch.stack([vx * torch.cos(yaw), vx * torch.sin(yaw), vz], dim=-1)
+        if self.plant == "px4_fit":
+            return self._step_px4_fit(v_cmd, r_cmd, yaw, r)
 
         v = self._v
         alpha = 1.0 - torch.exp(-self.lmbda.value * self.dt)
@@ -231,6 +267,42 @@ class VelocityPointMassModel(BaseDynamics):
         next_state = torch.cat([p_next, v_next, yaw_next.unsqueeze(-1), r_next.unsqueeze(-1)], dim=-1)
         self._state = self.grad_decay(next_state)
         self._acc = (v_next - v) / self.dt
+        self._vel_ema = torch.lerp(self._vel_ema, self._v, self.vel_ema_factor.value)
+
+    def _step_px4_fit(self, v_cmd: Tensor, r_cmd: Tensor, yaw: Tensor, r: Tensor) -> None:
+        cmd = torch.cat([v_cmd, r_cmd.unsqueeze(-1)], dim=-1)
+        self._cmd_buf = torch.cat([cmd.unsqueeze(0), self._cmd_buf[:-1]], dim=0)
+        k = self.px4_delay.value.round().long().clamp(0, self.px4_max_delay)
+        delayed = self._cmd_buf[k, torch.arange(self.n_envs, device=self.device)]  # [n_envs, 4]
+        g_xy = self.px4_gain_xy.value
+        v_sp = torch.cat([delayed[:, :2] * g_xy, delayed[:, 2:3]], dim=-1)
+        r_sp = delayed[:, 3]
+
+        h = self.dt / self.n_substeps
+        beta = 1.0 - torch.exp(-h / self.px4_acc_lag.value)
+        g_vec = self._G_vec.expand_as(v_sp)
+        p, v, a = self._p, self._v, self._acc
+        for _ in range(self.n_substeps):
+            a_cmd = self.px4_kv.value * (v_sp - v)
+            n_xy = a_cmd[:, :2].norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            a_cmd = torch.cat([a_cmd[:, :2] * (self.px4_a_xy_max / n_xy).clamp(max=1.), a_cmd[:, 2:3]], dim=-1)
+            f = a_cmd - g_vec  # specific thrust (g_vec points down)
+            nf = f.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            f = f * (nf.clamp(self.px4_thrust_min, self.px4_thrust_max) / nf)
+            a_cmd = f + g_vec
+            a = a + beta * (a_cmd - a)
+            v_new = v + a * h
+            p = p + 0.5 * h * (v + v_new)
+            v = v_new
+
+        alpha_r = 1.0 - torch.exp(-self.lmbda_yaw.value * self.dt)
+        r_next = torch.lerp(r, r_sp, alpha_r)
+        yaw_next = yaw + self.dt * 0.5 * (r + r_next)
+        yaw_next = torch.atan2(torch.sin(yaw_next), torch.cos(yaw_next))
+
+        next_state = torch.cat([p, v, yaw_next.unsqueeze(-1), r_next.unsqueeze(-1)], dim=-1)
+        self._state = self.grad_decay(next_state)
+        self._acc = a
         self._vel_ema = torch.lerp(self._vel_ema, self._v, self.vel_ema_factor.value)
 
     @torch.no_grad()
