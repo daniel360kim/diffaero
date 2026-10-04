@@ -32,7 +32,7 @@ loss_weights:
     pos: 5.
     collision: 0.
     yaw_rate: 0.05  # vx_vz_yawrate only: penalty on the yaw-rate command [rad/s]^2
-    heading: 0.25   # vx_vz_yawrate only: 1 - cos(yaw - bearing to goal); 1.0 goal-locked the nose (round 2)
+    heading: 0.     # vx_vz_yawrate only: 1 - cos(yaw - bearing to goal). Off: 1.0 goal-locked the nose, 0.25 cut s-band success 0.51 -> 0.31 (Starling round, 2026-10-04)
   quadrotor:
     vel: 2.
     oa: 5.
